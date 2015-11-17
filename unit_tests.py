@@ -42,7 +42,7 @@ class BaseCase(TestCase):
         packets = collectd.messages(stats)
         self.assertEqual(expected_message_count, len(packets))
         for packet in packets:
-            self.assertValidPacket(8, packet)
+            self.assertValidPacket(7, packet)
 
 
 class CounterTests(BaseCase):
@@ -180,7 +180,7 @@ class PacketTests(BaseCase):
     
     def test_start_valid(self):
         for params in [{}, {"host":""}, {"when":time.time()}]:
-            self.assertValidPacket(6, collectd.message_start(**params))
+            self.assertValidPacket(5, collectd.message_start(**params))
     
     def test_empty_messages(self):
         self.assertValidMessages(0, {})
@@ -267,7 +267,12 @@ class SocketTests(BaseCase):
         collectd.take_snapshots()
         collectd.send_stats(raise_on_empty = True)
         packet = self.server.recv(collectd.MAX_PACKET_SIZE)
-        self.assertValidPacket(8, packet)
+        n = 7
+        if hasattr(conn, '_plugin_inst') and conn._plugin_inst:
+            n += 1
+        if hasattr(conn, '_type_inst') and conn._type_inst:
+            n += 1
+        self.assertValidPacket(n, packet)
         return packet
     
     def test_empty(self):
@@ -307,7 +312,7 @@ class SocketTests(BaseCase):
             packet = self.server.recv(collectd.MAX_PACKET_SIZE)
             self.assertTrue(name + "\0" in packet)
             self.assertTrue(struct.pack("<d", val) in packet)
-            self.assertValidPacket(8, packet)
+            self.assertValidPacket(7, packet)
     
     def test_too_many(self):
         stats = [("x{0:02}".format(i), randrange(256)) for i in range(50)]
@@ -317,7 +322,7 @@ class SocketTests(BaseCase):
         
         packets = [self.server.recv(collectd.MAX_PACKET_SIZE) for i in range(2)]
         for packet in packets:
-            self.assertValidPacket(8, packet)
+            self.assertValidPacket(7, packet)
         
         data = "".join(packets)
         for name,val in stats:

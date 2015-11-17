@@ -43,6 +43,12 @@ VALUE_CODES = {
     VALUE_DERIVE:   "!q",
     VALUE_ABSOLUTE: "!Q"
 }
+DS_TYPES = {
+    'COUNTER':  VALUE_COUNTER,
+    'GAUGE':    VALUE_GAUGE,
+    'DERIVE':   VALUE_DERIVE,
+    'ABSOLUTE': VALUE_ABSOLUTE
+}
 
 
 def pack_numeric(type_code, number):
@@ -51,12 +57,20 @@ def pack_numeric(type_code, number):
 def pack_string(type_code, string):
     return struct.pack("!HH", type_code, 5 + len(string)) + string + "\0"
 
-def pack_value(name, value):
-    return "".join([
-        pack(TYPE_TYPE_INSTANCE, name),
-        struct.pack("!HHH", TYPE_VALUES, 15, 1),
-        struct.pack("<Bd", VALUE_GAUGE, value)
-    ])
+def pack_value(name, value, type=VALUE_GAUGE):
+    packed = []
+    if isinstance(value, (list, tuple)):
+        packed.append(struct.pack("!HHH", TYPE_VALUES, 6 + 9*len(value), len(value)))
+        for v in value:
+            packed.append(struct.pack("<B", type))
+        for v in value:
+            packed.append(struct.pack("<d", v))
+    else:
+        if name != 'value':
+            packed.append(pack(TYPE_TYPE_INSTANCE, name))
+        packed.append(struct.pack("!HHH", TYPE_VALUES, 15, 1))
+        packed.append(struct.pack("<Bd", type, value))
+    return "".join(packed)
 
 def pack(id, value):
     if isinstance(id, basestring):
@@ -68,20 +82,48 @@ def pack(id, value):
     else:
         raise AssertionError("invalid type code " + str(id))
 
-def message_start(when=None, host=socket.gethostname(), plugin_inst="", plugin_name="any"):
-    return "".join([
-        pack(TYPE_HOST, host),
-        pack(TYPE_TIME, when or time.time()),
-        pack(TYPE_PLUGIN, plugin_name),
-        pack(TYPE_PLUGIN_INSTANCE, plugin_inst),
-        pack(TYPE_TYPE, PLUGIN_TYPE),
-        pack(TYPE_INTERVAL, SEND_INTERVAL)
-    ])
+def message_start(when=None, host=socket.gethostname(), plugin_inst="", plugin_name="any", type_name=""):
+    packed = []
+    packed.append(pack(TYPE_HOST, host))
+    packed.append(pack(TYPE_TIME, when or time.time()))
+    packed.append(pack(TYPE_PLUGIN, plugin_name))
+    if plugin_inst:
+        packed.append(pack(TYPE_PLUGIN_INSTANCE, plugin_inst))
+    packed.append(pack(TYPE_TYPE, type_name))
+    packed.append(pack(TYPE_INTERVAL, SEND_INTERVAL))
+    return "".join(packed)
 
-def messages(counts, when=None, host=socket.gethostname(), plugin_inst="", plugin_name="any"):
+def messages(counts, when=None, host=socket.gethostname(), plugin_inst="", plugin_name="any", type_name="", value_type=None):
     packets = []
-    start = message_start(when, host, plugin_inst, plugin_name)
-    parts = [pack(name, count) for name,count in counts.items()]
+    start = message_start(when, host, plugin_inst, plugin_name, type_name)
+
+    if isinstance(counts, dict):
+        parts = []
+        for name,count in counts.items():
+            if isinstance(count, (list, tuple)):
+                if value_type is None:
+                    if Counter._counters.has_key(name) and Counter._counters[name].types.has_key(name):
+                        value_type = Counter._counters[name].types[name]
+                    else:
+                        value_type = VALUE_GAUGE
+                parts.append(pack(TYPE_TYPE, name))
+                parts.append(pack_value('values', count, value_type))
+            else:
+                if isinstance(name, tuple):
+                    parts.append(pack(TYPE_TYPE, name[0]))
+                    if len(name) == 2:
+                        parts.append(pack(name[1], count))
+                    elif len(name) == 3:
+                        parts.append(pack('%s-%s' % name[1:], count))
+                else:
+                    parts.append(pack(name, count))
+    elif isinstance(counts, list):
+        if type_name and Counter._counters.has_key(type_name):
+            if Counter._counters[name].types.has_key(type_name):
+                value_type = Counter._counters[name].types[type_name]
+        parts = [pack_value('values', counts, value_type)]
+    else:
+        parts = [pack('value', counts)]
     parts = [p for p in parts if len(start) + len(p) <= MAX_PACKET_SIZE]
     if parts:
         curr, curr_len = [start], len(start)
@@ -119,10 +161,14 @@ def synchronized(method):
     return wrapped
 
 class Counter(object):
+    _counters = {}
+
     def __init__(self, category):
         self.category = category
         self._lock = RLock()
         self.counts = defaultdict(lambda: defaultdict(float))
+        self.types = defaultdict(lambda: VALUE_GAUGE)
+        self.__class__._counters[category] = self
     
     @swallow_errors
     @synchronized
@@ -130,23 +176,67 @@ class Counter(object):
         for specific in list(args) + [""]:
             assert isinstance(specific, basestring)
             for stat, value in kwargs.items():
-                assert isinstance(value, (int, float))
-                self.counts[str(specific)][str(stat)] += value
+                if isinstance(value, (list, tuple)):
+                    self.is_list = True
+                    for i, v in enumerate(value):
+                        assert isinstance(v, (int, float))
+                        self.counts[str(specific)][i] += v
+                else:
+                    assert isinstance(value, (int, float))
+                    self.counts[str(specific)][str(stat)] += value
+    
+    @swallow_errors
+    @synchronized
+    def set_type(self, **kwargs):
+        for stat, type in kwargs.items():
+            assert type in DS_TYPES.keys()
+            self.types[str(stat)] = DS_TYPES[type]
+    
+    @swallow_errors
+    @synchronized
+    def get_type(self, stat):
+        if self.types.has_key(str(stat)):
+            return self.types[str(stat)]
     
     @swallow_errors
     @synchronized
     def set_exact(self, **kwargs):
         for stat, value in kwargs.items():
-            assert isinstance(value, (int, float))
-            self.counts[""][str(stat)] = value
+            if isinstance(value, (list, tuple)):
+                self.is_list = True
+                for i, v in enumerate(value):
+                    assert isinstance(v, (int, float))
+                    self.counts[""][i] = v
+            else:
+                assert isinstance(value, (int, float))
+                self.counts[""][str(stat)] = value
     
     @synchronized
-    def snapshot(self):
+    def get_exact(self, *args):
+        if args:
+            counts = {}
+            for stat in args:
+                if self.counts[""].has_key(stat):
+                    counts[stat] = self.counts[""][stat]
+            return counts
+        else:
+            return dict([(self.category, [v for i, v in sorted(self.counts[""].items())])])
+
+    @synchronized
+    def snapshot(self, extend=False):
+        if hasattr(self, 'is_list'):
+            return dict([(self.category, [v for i, v in sorted(self.counts[""].items())])])
         totals = {}
         for specific,counts in self.counts.items():
             for stat in counts:
                 name_parts = map(sanitize, [self.category, specific, stat])
-                name = "-".join(name_parts).replace("--", "-")
+                if extend:
+                    if specific:
+                        name = tuple(name_parts[0:2])
+                    else:
+                        name = (name_parts[0], name_parts[2])
+                else:
+                    name = "-".join(name_parts).replace("--", "-")
                 totals[name] = counts[stat]
                 counts[stat] = 0.0
         return totals
@@ -188,8 +278,8 @@ class Connection(object):
         return self._counters[name]
     
     @synchronized
-    def _snapshot(self):
-        return [c.snapshot() for c in self._counters.values() if c.counts]
+    def _snapshot(self, extend=False):
+        return [c.snapshot(extend) for c in self._counters.values() if c.counts]
 
 
 
